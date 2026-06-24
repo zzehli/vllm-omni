@@ -378,9 +378,7 @@ def main():
 
     print(f"Total generation time: {generation_time:.2f} seconds")
 
-    output = args.output or (
-        "audiox_output.wav" if model_class_name == "AudioXPipeline" else "stable_audio_output.wav"
-    )
+    output = args.output or ("audiox_output.wav" if model_class_name == "AudioXPipeline" else "stable_audio_output.wav")
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".wav"
