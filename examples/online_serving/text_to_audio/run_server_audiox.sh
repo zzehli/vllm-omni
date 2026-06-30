@@ -1,5 +1,8 @@
 #!/bin/bash
 # AudioX online serving startup script.
+# AudioX requires an explicit pipeline class (`--model-class-name AudioXPipeline`).
+# Per-request task and sampler knobs are sent via `extra_body` on the standard
+# chat-completions endpoint (see run_curl_audiox.sh).
 
 MODEL="${MODEL:-zhangj1an/AudioX}"
 PORT="${PORT:-8099}"

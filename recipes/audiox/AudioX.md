@@ -24,7 +24,7 @@ that produces stereo 44.1 kHz audio up to ~10 s per call.
 - Input transforms: `vllm_omni.transformers_utils.processors.audiox`
 - Param contract: `vllm_omni/model_extras/audiox.py` (declared `extra_body` knobs)
 - Offline example: [`examples/offline_inference/text_to_audio/text_to_audio.py`](../../examples/offline_inference/text_to_audio/text_to_audio.py)
-- Online: standard OpenAI chat-completions endpoint (see commands below)
+- Online example: [`examples/online_serving/text_to_audio`](../../examples/online_serving/text_to_audio) (standard OpenAI chat-completions endpoint; see `run_curl_audiox.sh`)
 
 ## Hardware Support
 
@@ -74,6 +74,9 @@ python examples/offline_inference/text_to_audio/text_to_audio.py \
 ```
 
 Online:
+
+The standard `text_to_audio` online example provides launch/curl helpers
+(`run_server_audiox.sh`, `run_curl_audiox.sh`); the equivalent raw commands are:
 
 ```bash
 DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN \
