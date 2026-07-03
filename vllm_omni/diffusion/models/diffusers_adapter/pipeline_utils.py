@@ -21,6 +21,14 @@ class BasePipelineUtils:
     def validate_runtime_sampling_params(self, sampling: OmniDiffusionSamplingParams) -> None:
         pass
 
+    def remap_input_kwargs(self, input_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Rename keys in the prompt input dict to match the pipeline's __call__ signature.
+
+        The adapter always produces ``prompt`` / ``negative_prompt`` keys.
+        Override this method when the target pipeline uses different parameter names.
+        """
+        return input_kwargs
+
 
 class WanPipelineUtils(BasePipelineUtils):
     def update_load_kwargs(self, od_config: OmniDiffusionConfig, load_kwargs: dict[str, Any]) -> None:
@@ -48,12 +56,30 @@ class WanPipelineUtils(BasePipelineUtils):
             )
 
 
+class BooguImagePipelineUtils(BasePipelineUtils):
+    """Pipeline utils for BooguImagePipeline.
+
+    Boogu uses ``instruction`` / ``negative_instruction`` instead of the
+    standard diffusers ``prompt`` / ``negative_prompt`` parameter names.
+    """
+
+    _PROMPT_REMAP: dict[str, str] = {
+        "prompt": "instruction",
+        "negative_prompt": "negative_instruction",
+    }
+
+    def remap_input_kwargs(self, input_kwargs: dict[str, Any]) -> dict[str, Any]:
+        return {self._PROMPT_REMAP.get(k, k): v for k, v in input_kwargs.items()}
+
+
 PIPELINE_UTILS_REGISTRY: dict[str, type[BasePipelineUtils]] = {
     "WanPipeline": WanPipelineUtils,
     "WanImageToVideoPipeline": WanPipelineUtils,
     "WanVACEPipeline": WanPipelineUtils,
     "WanVideoToVideoPipeline": WanPipelineUtils,
     "WanAnimatePipeline": WanPipelineUtils,
+    "BooguImagePipeline": BooguImagePipelineUtils,
+    "BooguImagePromptTuningPipeline": BooguImagePipelineUtils,
 }
 
 

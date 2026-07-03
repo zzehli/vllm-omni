@@ -13,9 +13,12 @@ It does NOT support:
 - Step-wise execution (continuous batching)
 """
 
+import importlib
+import importlib.util
 import inspect
 import logging
 import re
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -86,6 +89,87 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             logger.info("Profiling enabled for DiffusersAdapterPipeline. Only 'forward' is supported.")
 
     # ------------------------------------------------------------------
+    # Custom pipeline class resolution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_custom_pipeline_class(model_id: str, class_name: str) -> type | None:
+        """Find a pipeline class that is not part of the standard diffusers library.
+
+        Strategy:
+        1. Read the .py stubs shipped in the model's cached snapshot to learn which
+           Python package owns the custom components (the stubs re-export from the
+           real package, so their ``from X.Y import ...`` lines reveal the name).
+        2. Text-search that package's source files for ``class <class_name>``
+           without importing every submodule.
+        3. Import only the one module that defines the class and return it.
+        """
+        from huggingface_hub import snapshot_download
+
+        try:
+            snapshot = Path(
+                snapshot_download(
+                    model_id,
+                    ignore_patterns=["*.safetensors", "*.bin", "*.gguf", "*.pt"],
+                )
+            )
+        except Exception:
+            return None
+
+        # Common packages whose names in import statements are not candidates.
+        _skip = {
+            "diffusers", "transformers", "torch", "torchvision", "numpy",
+            "typing", "pathlib", "os", "sys", "re", "json", "abc",
+            "collections", "dataclasses", "functools", "itertools", "math",
+            "warnings", "accelerate", "peft", "PIL", "scipy", "einops",
+            "huggingface_hub", "safetensors",
+        }
+
+        # Collect candidate top-level package names from the snapshot stubs.
+        candidate_pkgs: set[str] = set()
+        for py_file in snapshot.rglob("*.py"):
+            try:
+                for m in re.finditer(
+                    r"^\s*from\s+(\w+)\.", py_file.read_text(), re.MULTILINE
+                ):
+                    pkg = m.group(1)
+                    if pkg not in _skip:
+                        candidate_pkgs.add(pkg)
+            except Exception:
+                continue
+
+        for pkg_name in candidate_pkgs:
+            try:
+                pkg_spec = importlib.util.find_spec(pkg_name)
+            except Exception:
+                continue
+            if pkg_spec is None or pkg_spec.origin is None:
+                continue
+
+            pkg_dir = Path(pkg_spec.origin).parent
+
+            # Text-search all .py files in the package WITHOUT importing them.
+            for py_file in pkg_dir.rglob("*.py"):
+                try:
+                    if f"class {class_name}" not in py_file.read_text():
+                        continue
+                except Exception:
+                    continue
+
+                # Convert file path to dotted module name and import it.
+                try:
+                    rel = py_file.relative_to(pkg_dir.parent)
+                    modname = str(rel.with_suffix("")).replace("/", ".")
+                    mod = importlib.import_module(modname)
+                    cls = getattr(mod, class_name, None)
+                    if cls is not None:
+                        return cls
+                except Exception:
+                    continue
+
+        return None
+
+    # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
 
@@ -103,6 +187,41 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         pipeline_class = self.od_config.diffusers_pipeline_cls
         pipeline_class_name = pipeline_class.__name__ if pipeline_class is not None else None
+
+        # When the pipeline class is not part of the standard diffusers library,
+        # diffusers' _get_pipeline_class raises AttributeError. Resolve the class
+        # by text-searching installed packages whose names appear in the model's
+        # cached Python stubs, then call found_cls.from_pretrained() directly.
+        if pipeline_class is None:
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+            config_dict = get_hf_file_to_dict("model_index.json", model_id) or {}
+            cls_name = config_dict.get("_class_name")
+            if cls_name:
+                found = DiffusersAdapterPipeline._find_custom_pipeline_class(
+                    model_id, cls_name
+                )
+                if found is not None:
+                    logger.info(
+                        "Pipeline class %s not in diffusers; found in %s. "
+                        "Calling %s.from_pretrained() directly.",
+                        cls_name,
+                        found.__module__,
+                        found.__name__,
+                    )
+                    pipeline_class = found
+                    pipeline_class_name = found.__name__
+                    if "trust_remote_code" not in load_kwargs:
+                        load_kwargs["trust_remote_code"] = True
+                else:
+                    logger.warning(
+                        "Pipeline class %s not found in diffusers or any installed "
+                        "package. Install the model's companion package (e.g. "
+                        "`pip install -e /path/to/model-repo`) and retry.",
+                        cls_name,
+                    )
+
+        logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
+
         self._pipeline_utils = get_pipeline_utils(pipeline_class_name)
         self._pipeline_utils.update_load_kwargs(self.od_config, load_kwargs)
         component_names = (
@@ -113,7 +232,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         apply_diffusers_quantization_config(self.od_config, load_kwargs, component_names)
         logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
-        self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
+        loader_cls = pipeline_class if pipeline_class is not None else DiffusionPipeline
+        self._pipeline = loader_cls.from_pretrained(model_id, **load_kwargs)
         self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
 
         self._pipeline.to(self.device)
@@ -337,7 +457,9 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def _build_call_kwargs(self, req: DiffusionRequestBatch) -> dict[str, Any]:
         """Translate a ``DiffusionRequestBatch`` into diffusers ``__call__`` kwargs."""
         sampling = req.sampling_params
-        input_kwargs = self._extract_input(req.prompts)
+        input_kwargs = self._pipeline_utils.remap_input_kwargs(
+            self._extract_input(req.prompts)
+        )
 
         self._pipeline_utils.validate_runtime_sampling_params(sampling)
 
