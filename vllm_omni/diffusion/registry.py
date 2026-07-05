@@ -141,6 +141,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "BooguImagePipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImagePipeline",
+    ),
     "LancePipeline": (
         "lance",
         "pipeline_lance",
