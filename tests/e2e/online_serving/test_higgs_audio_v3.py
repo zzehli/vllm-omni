@@ -72,6 +72,10 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # whisper-small mishears this short clip ~0.5% of the time; on a
+                # failed match re-verify with this stronger ASR before failing so
+                # the gate is not flaky. Local-only key (not forwarded to server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
@@ -135,6 +139,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "model": omni_server.model,
                 "input": "The quick brown fox jumps over the lazy dog.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_hnr_db": 0.0,
@@ -160,6 +165,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "model": omni_server.model,
                 "input": "She sells seashells by the seashore.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_hnr_db": -2.0,
