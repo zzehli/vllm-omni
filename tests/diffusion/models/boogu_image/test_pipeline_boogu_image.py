@@ -333,7 +333,83 @@ def test_reshape_embeds_and_mask_list_branch():
     assert torch.equal(reshaped[0][2], reshaped[0][3])
 
 
-def test_forward_not_implemented():
+class _FakeTransformer:
+    """Fake denoiser: velocity 0 (identity flow) with the config the loop reads."""
+
+    in_channels = 4
+    axes_dim_rope = (8, 4, 4)
+    axes_lens = (32, 16, 16)
+    dtype = torch.float32
+    instruction_feature_configs = {
+        "instruction_feat_dim": _EMBED_DIM,
+        "num_instruction_feature_layers": 1,
+        "reduce_type": "mean",
+    }
+
+    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+        return torch.zeros_like(latents)
+
+
+class _FakeScheduler:
+    def set_timesteps(self, num_inference_steps, device=None, num_tokens=None):
+        self.timesteps = torch.linspace(0, 1, num_inference_steps + 1)[:-1]
+
+    def step(self, model_output, t, latents, return_dict=False):
+        return (latents,)
+
+
+class _FakeDecodeVAE:
+    dtype = torch.float32
+
+    def __init__(self):
+        self.config = SimpleNamespace(scaling_factor=1.0, shift_factor=0.0, block_out_channels=[128, 256, 512, 512])
+
+    def decode(self, latents, return_dict=False):
+        batch = latents.shape[0]
+        return (torch.zeros(batch, 3, 16, 16),)
+
+
+def _make_forward_pipeline():
     pipeline = _make_encode_pipeline()
-    with pytest.raises(NotImplementedError):
-        pipeline.forward()
+    pipeline.transformer = _FakeTransformer()
+    pipeline.scheduler = _FakeScheduler()
+    pipeline.vae = _FakeDecodeVAE()
+    pipeline.vae_scale_factor = 8
+    pipeline.default_sample_size = 128
+    return pipeline
+
+
+def _make_request_batch(prompt, **sampling_overrides):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    sampling = OmniDiffusionSamplingParams(**sampling_overrides)
+    return SimpleNamespace(prompts=[prompt], sampling_params=sampling)
+
+
+def test_forward_returns_diffusion_output():
+    from vllm_omni.diffusion.data import DiffusionOutput
+
+    pipeline = _make_forward_pipeline()
+    req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=2)
+
+    out = pipeline.forward(req)
+
+    assert isinstance(out, DiffusionOutput)
+    assert isinstance(out.output, torch.Tensor)
+    assert out.output.shape[0] == 1
+    assert torch.isfinite(out.output).all()
+    # CFG default is on (text guidance 4.0), so the encoder ran twice (pos + neg).
+    assert len(pipeline.processor.calls) == 2
+
+
+def test_forward_cfg_off_when_guidance_one():
+    pipeline = _make_forward_pipeline()
+    req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=2, guidance_scale=1.0)
+    # guidance_scale=1.0 is falsy-adjacent but explicitly disables CFG; the
+    # request layer would set guidance_scale_provided, so emulate that here.
+    req.sampling_params.guidance_scale_provided = True
+
+    pipeline.forward(req)
+
+    # Only the positive prompt is encoded when CFG is off.
+    assert len(pipeline.processor.calls) == 1

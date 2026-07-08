@@ -14,11 +14,14 @@
 #   - Training-time features (prompt tuning, gradient checkpointing) and
 #     inference caches (TeaCache/TaylorSeer) are not ported.
 
+import itertools
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps, get_1d_rotary_pos_embed
-from einops import repeat
+from einops import rearrange, repeat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -26,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -796,7 +800,6 @@ def _cal_preprocessed_instruction_feat_dim(instruction_feature_configs: dict) ->
         raise ValueError(f"Invalid reduce_type: {reduce_type}")
 
 
-
 class BooguImageTransformer2DModel(nn.Module):
     """Boogu-Image transformer with mixed stream topology.
 
@@ -980,8 +983,381 @@ class BooguImageTransformer2DModel(nn.Module):
         # Distinguish multiple reference images (max 5).
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "BooguImageTransformer2DModel.forward() lands with the pipeline denoising "
-            "loop (step 12 of the native support plan)."
+    def preprocess_instruction_hidden_states(self, raw_instruction_hidden_states):
+        """Reduce the raw MLLM hidden states to the transformer feature dim.
+
+        Mirrors upstream ``preprocess_instruction_hidden_states``: a single
+        tensor passes through unchanged; a list of per-layer states is combined
+        by ``concat`` or ``mean`` according to ``instruction_feature_configs``.
+        """
+        cfg = self.instruction_feature_configs
+        num_instruction_feat_layers = max(cfg.get("num_instruction_feat_layers", 1), 1)
+        reduce_type = cfg.get("reduce_type", "concat")
+
+        if isinstance(raw_instruction_hidden_states, torch.Tensor):
+            instruction_hidden_states = raw_instruction_hidden_states
+        elif isinstance(raw_instruction_hidden_states, (list, tuple)):
+            assert len(raw_instruction_hidden_states) == num_instruction_feat_layers
+            if "cat" in reduce_type.lower():
+                instruction_hidden_states = torch.cat(raw_instruction_hidden_states, dim=-1)
+            elif "mean" in reduce_type.lower():
+                instruction_hidden_states = torch.mean(torch.stack(raw_instruction_hidden_states), dim=0)
+            else:
+                raise ValueError(f"Invalid reduce_type: {reduce_type}")
+        else:
+            raise ValueError(
+                "Invalid type of raw_instruction_hidden_states, expected torch.Tensor or list, "
+                f"but got {type(raw_instruction_hidden_states)}"
+            )
+
+        assert self.preprocessed_instruction_feat_dim == instruction_hidden_states.shape[-1]
+        return instruction_hidden_states
+
+    def flat_and_pad_to_seq(self, hidden_states, ref_image_hidden_states):
+        """Flatten patch tokens and pad to batched sequences.
+
+        Ported from upstream; for text-to-image ``ref_image_hidden_states`` is
+        ``None`` and the reference-image branch collapses to zero-length.
+        """
+        batch_size = len(hidden_states)
+        p = self.patch_size
+        device = hidden_states[0].device
+
+        img_sizes = [(img.size(1), img.size(2)) for img in hidden_states]
+        l_effective_img_len = [(H // p) * (W // p) for (H, W) in img_sizes]
+
+        if ref_image_hidden_states is not None:
+            ref_img_sizes = [
+                [(img.size(1), img.size(2)) for img in imgs] if imgs is not None else None
+                for imgs in ref_image_hidden_states
+            ]
+            l_effective_ref_img_len = [
+                [(ref_img_size[0] // p) * (ref_img_size[1] // p) for ref_img_size in _ref_img_sizes]
+                if _ref_img_sizes is not None
+                else [0]
+                for _ref_img_sizes in ref_img_sizes
+            ]
+        else:
+            ref_img_sizes = [None for _ in range(batch_size)]
+            l_effective_ref_img_len = [[0] for _ in range(batch_size)]
+
+        max_ref_img_len = max(sum(ref_img_len) for ref_img_len in l_effective_ref_img_len)
+        max_img_len = max(l_effective_img_len)
+
+        # Reference-image patch embeddings.
+        flat_ref_img_hidden_states = []
+        for i in range(batch_size):
+            if ref_img_sizes[i] is not None:
+                imgs = []
+                for ref_img in ref_image_hidden_states[i]:
+                    C, H, W = ref_img.size()
+                    ref_img = rearrange(ref_img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p)
+                    imgs.append(ref_img)
+                flat_ref_img_hidden_states.append(torch.cat(imgs, dim=0))
+            else:
+                flat_ref_img_hidden_states.append(None)
+
+        # Noise-image patch embeddings.
+        flat_hidden_states = []
+        for i in range(batch_size):
+            img = hidden_states[i]
+            C, H, W = img.size()
+            img = rearrange(img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p)
+            flat_hidden_states.append(img)
+
+        padded_ref_img_hidden_states = torch.zeros(
+            batch_size,
+            max_ref_img_len,
+            flat_hidden_states[0].shape[-1],
+            device=device,
+            dtype=flat_hidden_states[0].dtype,
         )
+        padded_ref_img_mask = torch.zeros(batch_size, max_ref_img_len, dtype=torch.bool, device=device)
+        for i in range(batch_size):
+            if ref_img_sizes[i] is not None:
+                padded_ref_img_hidden_states[i, : sum(l_effective_ref_img_len[i])] = flat_ref_img_hidden_states[i]
+                padded_ref_img_mask[i, : sum(l_effective_ref_img_len[i])] = True
+
+        padded_hidden_states = torch.zeros(
+            batch_size,
+            max_img_len,
+            flat_hidden_states[0].shape[-1],
+            device=device,
+            dtype=flat_hidden_states[0].dtype,
+        )
+        padded_img_mask = torch.zeros(batch_size, max_img_len, dtype=torch.bool, device=device)
+        for i in range(batch_size):
+            padded_hidden_states[i, : l_effective_img_len[i]] = flat_hidden_states[i]
+            padded_img_mask[i, : l_effective_img_len[i]] = True
+
+        return (
+            padded_hidden_states,
+            padded_ref_img_hidden_states,
+            padded_img_mask,
+            padded_ref_img_mask,
+            l_effective_ref_img_len,
+            l_effective_img_len,
+            ref_img_sizes,
+            img_sizes,
+        )
+
+    def img_patch_embed_and_refine(
+        self,
+        hidden_states,
+        ref_image_hidden_states,
+        padded_img_mask,
+        padded_ref_img_mask,
+        noise_rotary_emb,
+        ref_img_rotary_emb,
+        l_effective_ref_img_len,
+        l_effective_img_len,
+        temb,
+    ):
+        """Embed image patches and run the refiner blocks.
+
+        The reference-image refiner is skipped when there are no reference-image
+        tokens (text-to-image), which is numerically identical to upstream (the
+        combined sequence only reads ``[:sum(ref_img_len)]`` = empty) while
+        avoiding a degenerate zero-length attention.
+        """
+        batch_size = len(hidden_states)
+        max_combined_img_len = max(
+            img_len + sum(ref_img_len) for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len)
+        )
+
+        hidden_states = self.x_embedder(hidden_states)
+        ref_image_hidden_states = self.ref_image_patch_embedder(ref_image_hidden_states)
+
+        for i in range(batch_size):
+            shift = 0
+            for j, ref_img_len in enumerate(l_effective_ref_img_len[i]):
+                ref_image_hidden_states[i, shift : shift + ref_img_len, :] = (
+                    ref_image_hidden_states[i, shift : shift + ref_img_len, :] + self.image_index_embedding[j]
+                )
+                shift += ref_img_len
+
+        for layer in self.noise_refiner:
+            hidden_states = layer(hidden_states, padded_img_mask, noise_rotary_emb, temb)
+
+        flat_l_effective_ref_img_len = list(itertools.chain(*l_effective_ref_img_len))
+        num_ref_images = len(flat_l_effective_ref_img_len)
+        max_ref_img_len = max(flat_l_effective_ref_img_len)
+
+        if max_ref_img_len > 0:
+            batch_ref_img_mask = ref_image_hidden_states.new_zeros(num_ref_images, max_ref_img_len, dtype=torch.bool)
+            batch_ref_image_hidden_states = ref_image_hidden_states.new_zeros(
+                num_ref_images, max_ref_img_len, self.hidden_size
+            )
+            batch_ref_img_rotary_emb = hidden_states.new_zeros(
+                num_ref_images, max_ref_img_len, ref_img_rotary_emb.shape[-1], dtype=ref_img_rotary_emb.dtype
+            )
+            batch_temb = temb.new_zeros(num_ref_images, *temb.shape[1:], dtype=temb.dtype)
+
+            # Flatten reference images into a temporary batch.
+            idx = 0
+            for i in range(batch_size):
+                shift = 0
+                for ref_img_len in l_effective_ref_img_len[i]:
+                    batch_ref_img_mask[idx, :ref_img_len] = True
+                    batch_ref_image_hidden_states[idx, :ref_img_len] = ref_image_hidden_states[
+                        i, shift : shift + ref_img_len
+                    ]
+                    batch_ref_img_rotary_emb[idx, :ref_img_len] = ref_img_rotary_emb[i, shift : shift + ref_img_len]
+                    batch_temb[idx] = temb[i]
+                    shift += ref_img_len
+                    idx += 1
+
+            for layer in self.ref_image_refiner:
+                batch_ref_image_hidden_states = layer(
+                    batch_ref_image_hidden_states, batch_ref_img_mask, batch_ref_img_rotary_emb, batch_temb
+                )
+
+            # Restore reference-image sequence layout.
+            idx = 0
+            for i in range(batch_size):
+                shift = 0
+                for ref_img_len in l_effective_ref_img_len[i]:
+                    ref_image_hidden_states[i, shift : shift + ref_img_len] = batch_ref_image_hidden_states[
+                        idx, :ref_img_len
+                    ]
+                    shift += ref_img_len
+                    idx += 1
+
+        combined_img_hidden_states = hidden_states.new_zeros(batch_size, max_combined_img_len, self.hidden_size)
+        for i, (ref_img_len, img_len) in enumerate(zip(l_effective_ref_img_len, l_effective_img_len)):
+            combined_img_hidden_states[i, : sum(ref_img_len)] = ref_image_hidden_states[i, : sum(ref_img_len)]
+            combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
+
+        return combined_img_hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor | list[torch.Tensor],
+        timestep: torch.Tensor,
+        instruction_hidden_states: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        instruction_attention_mask: torch.Tensor,
+        ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
+        """Denoise one step: refiner -> double-stream -> fuse -> single-stream -> unpatchify.
+
+        Ported from upstream ``BooguImageTransformer2DModel.forward`` with the
+        TeaCache/TaylorSeer/PEFT/gradient-checkpointing branches removed. Returns
+        the velocity prediction as a ``[B, C, H_lat, W_lat]`` tensor.
+        """
+        instruction_hidden_states = self.preprocess_instruction_hidden_states(instruction_hidden_states)
+
+        batch_size = len(hidden_states)
+        is_hidden_states_tensor = isinstance(hidden_states, torch.Tensor)
+        if is_hidden_states_tensor:
+            assert hidden_states.ndim == 4
+            hidden_states = [_hidden_states for _hidden_states in hidden_states]
+
+        device = hidden_states[0].device
+
+        # Timestep and instruction embedding.
+        temb, instruction_hidden_states = self.time_caption_embed(
+            timestep, instruction_hidden_states, hidden_states[0].dtype
+        )
+
+        # Flatten and pad token sequences.
+        (
+            hidden_states,
+            ref_image_hidden_states,
+            img_mask,
+            ref_img_mask,
+            l_effective_ref_img_len,
+            l_effective_img_len,
+            ref_img_sizes,
+            img_sizes,
+        ) = self.flat_and_pad_to_seq(hidden_states, ref_image_hidden_states)
+
+        # Build rotary embeddings and sequence lengths.
+        (
+            context_rotary_emb,
+            ref_img_rotary_emb,
+            noise_rotary_emb,
+            rotary_emb,
+            encoder_seq_lengths,
+            seq_lengths,
+            combined_img_rotary_emb,
+            combined_img_seq_lengths,
+        ) = self.rope_embedder(
+            freqs_cis,
+            instruction_attention_mask,
+            l_effective_ref_img_len,
+            l_effective_img_len,
+            ref_img_sizes,
+            img_sizes,
+            device,
+        )
+
+        # Context refinement.
+        for layer in self.context_refiner:
+            instruction_hidden_states = layer(instruction_hidden_states, instruction_attention_mask, context_rotary_emb)
+
+        # Image patch embedding and refinement.
+        combined_img_hidden_states = self.img_patch_embed_and_refine(
+            hidden_states,
+            ref_image_hidden_states,
+            img_mask,
+            ref_img_mask,
+            noise_rotary_emb,
+            ref_img_rotary_emb,
+            l_effective_ref_img_len,
+            l_effective_img_len,
+            temb,
+        )
+
+        instruct_hidden_states = instruction_hidden_states
+        img_hidden_states = combined_img_hidden_states
+
+        # Joint mask for [instruct + image].
+        max_seq_len = max(seq_lengths)
+        joint_attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
+        for i, seq_len in enumerate(seq_lengths):
+            joint_attention_mask[i, :seq_len] = True
+
+        # Dual-stream (double-stream) stage.
+        if self.num_double_stream_layers > 0:
+            max_img_len = max(combined_img_seq_lengths)
+            img_attention_mask = hidden_states.new_zeros(batch_size, max_img_len, dtype=torch.bool)
+            for i, img_seq_len in enumerate(combined_img_seq_lengths):
+                img_attention_mask[i, :img_seq_len] = True
+
+            for layer in self.double_stream_layers:
+                img_hidden_states, instruct_hidden_states = layer(
+                    img_hidden_states,
+                    instruct_hidden_states,
+                    img_attention_mask,
+                    joint_attention_mask,
+                    combined_img_rotary_emb,
+                    rotary_emb,
+                    temb,
+                    encoder_seq_lengths,
+                    seq_lengths,
+                )
+
+        # Fuse streams to joint sequence.
+        joint_hidden_states = hidden_states.new_zeros(batch_size, max(seq_lengths), self.hidden_size)
+        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+            joint_hidden_states[i, :encoder_seq_len] = instruct_hidden_states[i, :encoder_seq_len]
+            joint_hidden_states[i, encoder_seq_len:seq_len] = img_hidden_states[i, : seq_len - encoder_seq_len]
+
+        # Single-stream stage.
+        hidden_states = joint_hidden_states
+        for layer in self.single_stream_layers:
+            hidden_states = layer(hidden_states, joint_attention_mask, rotary_emb, temb)
+
+        # Output projection.
+        hidden_states = self.norm_out(hidden_states, temb)
+
+        # Reshape back to image format.
+        p = self.patch_size
+        output = []
+        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
+            height, width = img_size
+            img_tokens = hidden_states[i][seq_len - img_len : seq_len]
+            img_output = rearrange(
+                img_tokens,
+                "(h w) (p1 p2 c) -> c (h p1) (w p2)",
+                h=height // p,
+                w=width // p,
+                p1=p,
+                p2=p,
+            )
+            output.append(img_output)
+
+        if is_hidden_states_tensor:
+            output = torch.stack(output, dim=0)
+
+        return output
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load diffusers-named checkpoint weights into the native module.
+
+        Two name promotions relative to upstream (see step 8/10 findings):
+
+        - ``*.img_instruct_attn.processor.{img,instruct}_{to_q,to_k,to_v}`` /
+          ``{instruct,img}_out`` -> drop ``.processor`` (upstream keeps the
+          joint-attention projections on the attention processor; the native
+          module hosts them directly).
+        - ``*.to_out.0.weight`` -> ``*.to_out.weight`` (diffusers wraps the
+          output projection in a ``ModuleList``; the native module uses a plain
+          linear).
+        """
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if ".img_instruct_attn.processor." in name:
+                name = name.replace(".img_instruct_attn.processor.", ".img_instruct_attn.")
+            if ".to_out.0." in name:
+                name = name.replace(".to_out.0.", ".to_out.")
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params

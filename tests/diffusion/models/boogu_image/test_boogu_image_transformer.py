@@ -244,9 +244,6 @@ def test_transformer_instantiates():
     assert model.x_embedder.in_features == 2 * 2 * 4
     assert model.x_embedder.out_features == HIDDEN_SIZE
 
-    with pytest.raises(NotImplementedError):
-        model(torch.zeros(1))
-
 
 def test_transformer_validates_rope_dims():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
@@ -264,3 +261,85 @@ def test_transformer_rejects_prompt_tuning():
 
     with pytest.raises(NotImplementedError, match="[Pp]rompt tuning"):
         BooguImageTransformer2DModel(od_config=_tiny_od_config(prompt_tuning_configs={"use_prompt_tuning": True}))
+
+
+def _native_to_checkpoint_name(name: str) -> str:
+    """Inverse of ``load_weights`` remapping: native param name -> diffusers name.
+
+    - ``.to_out.<suffix>`` -> ``.to_out.0.<suffix>`` (diffusers ModuleList wrap).
+    - promoted joint-attention projections move back under ``.processor.``.
+    """
+    if ".to_out." in name:
+        name = name.replace(".to_out.", ".to_out.0.")
+    for proj in (
+        "img_to_q",
+        "img_to_k",
+        "img_to_v",
+        "instruct_to_q",
+        "instruct_to_k",
+        "instruct_to_v",
+        "instruct_out",
+        "img_out",
+    ):
+        token = f".img_instruct_attn.{proj}."
+        if token in name:
+            name = name.replace(token, f".img_instruct_attn.processor.{proj}.")
+            break
+    return name
+
+
+def test_transformer_load_weights_round_trip():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    native_params = dict(model.named_parameters())
+
+    # Build synthetic diffusers-named weights (one per native parameter).
+    checkpoint_weights = {}
+    for native_name, param in native_params.items():
+        checkpoint_weights[_native_to_checkpoint_name(native_name)] = torch.randn_like(param)
+
+    # The remapping must be a bijection over the parameter set.
+    assert len(checkpoint_weights) == len(native_params)
+
+    loaded = model.load_weights(list(checkpoint_weights.items()))
+
+    # No missing / unexpected parameters.
+    assert loaded == set(native_params.keys())
+
+    # Values landed on the right parameters (TP=1: weight_loader copies verbatim).
+    reloaded = dict(model.named_parameters())
+    for native_name in native_params:
+        expected = checkpoint_weights[_native_to_checkpoint_name(native_name)]
+        assert torch.allclose(reloaded[native_name], expected)
+
+
+def test_transformer_forward_t2i_shape():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    model.eval()
+
+    batch_size = 1
+    in_channels = 4
+    latent_h = latent_w = 8  # multiples of patch_size (2)
+    instruct_len = 8
+    instruction_feat_dim = 32  # matches _tiny_tf_model_config
+
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
+    instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
+    freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(model.axes_dim_rope, model.axes_lens, theta=10000)
+
+    with torch.no_grad():
+        out = model(latents, timestep, instruction_hidden_states, freqs_cis, instruction_attention_mask)
+
+    assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
+    assert torch.isfinite(out).all()

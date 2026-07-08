@@ -19,29 +19,66 @@ Ported from the upstream ``boogu`` package
   yet; it lands together with the post-process registration.
 """
 
+import json
 import os
 import warnings
 from collections.abc import Iterable
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import BooguImageTransformer2DModel
+from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+    BooguImageDoubleStreamRotaryPosEmbed,
+    BooguImageTransformer2DModel,
+)
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
     FlowMatchEulerDiscreteScheduler,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
+
+
+def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
+    """Build the post-process callable that converts decoded tensors to images.
+
+    Upstream ``BooguImageProcessor`` only customizes *pre*-processing; the
+    ``postprocess`` path is inherited from the stock diffusers
+    ``VaeImageProcessor``, so we reuse it directly here.
+    """
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+    def post_process_func(images: torch.Tensor):
+        return image_processor.postprocess(images)
+
+    return post_process_func
+
 
 # System prompts matching upstream dataset logic (ported verbatim from
 # ``BooguImagePipeline.__init__``).
@@ -56,7 +93,7 @@ SYSTEM_PROMPT_4_T2I_UNIFIED = (
 )
 
 
-class BooguImagePipeline(nn.Module, SupportsComponentDiscovery):
+class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
     """Boogu-Image text-to-image pipeline (native vLLM-Omni implementation)."""
 
     supports_request_batch = False
@@ -308,8 +345,147 @@ class BooguImagePipeline(nn.Module, SupportsComponentDiscovery):
             negative_prompt_attention_mask,
         )
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "BooguImagePipeline.forward (denoise loop + VAE decode) is not implemented yet; "
-            "it lands together with the post-process registration."
+    # ------------------------------------------------------------------
+    # Denoise loop + VAE decode (upstream ``__call__`` / ``processing``, t2i)
+    # ------------------------------------------------------------------
+
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        """Sample initial noise latents (upstream ``prepare_latents``)."""
+        height = int(height) // self.vae_scale_factor
+        width = int(width) // self.vae_scale_factor
+        shape = (batch_size, num_channels_latents, height, width)
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device)
+        return latents
+
+    def _resolve_output_size(self, height, width):
+        """t2i branch of upstream ``_resolve_output_and_original_size``.
+
+        Clamps the working resolution to ``max_input_image_pixels`` (2048**2),
+        rounding down to a multiple of ``vae_scale_factor * 2``; the requested
+        size is remembered so the decoded image can be resized back.
+        """
+        img_scale_num = self.vae_scale_factor * 2
+        ori_height, ori_width = height, width
+        max_pixels = 2048 * 2048
+        cur_pixels = height * width
+        ratio = min((max_pixels / cur_pixels) ** 0.5, 1.0)
+        height = int(height * ratio) // img_scale_num * img_scale_num
+        width = int(width * ratio) // img_scale_num * img_scale_num
+        return height, width, ori_height, ori_width
+
+    def predict(self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask):
+        """One transformer velocity prediction (upstream ``predict``, t2i)."""
+        timestep = t.expand(latents.shape[0]).to(latents.dtype)
+        return self.transformer(
+            latents,
+            timestep,
+            instruction_embeds,
+            freqs_cis,
+            instruction_attention_mask,
+            ref_image_hidden_states=None,
         )
+
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        # Prompt / negative-prompt extraction (mirrors the Ovis pattern; the
+        # online API sometimes passes ``{"negative_prompt": None}``).
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        else:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
+        sp = req.sampling_params
+        device = self._execution_device
+
+        height = sp.height or self.default_sample_size * self.vae_scale_factor
+        width = sp.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sp.num_inference_steps or 50
+        # Upstream default text guidance is 4.0; the engine coerces an unset
+        # guidance_scale to 1.0, so only honor a caller-provided value.
+        text_guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 4.0
+        num_images_per_prompt = sp.num_outputs_per_prompt if sp.num_outputs_per_prompt > 0 else 1
+        generator = sp.generator
+        max_sequence_length = sp.max_sequence_length or 1280
+        output_type = sp.output_type or "pil"
+        cfg_range = (0.0, 1.0)
+
+        do_classifier_free_guidance = text_guidance_scale > 1.0
+
+        batch_size = len(prompt)
+
+        # 1. Encode prompts.
+        (
+            instruction_embeds,
+            instruction_attention_mask,
+            negative_instruction_embeds,
+            negative_instruction_attention_mask,
+        ) = self.encode_prompt(
+            prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            max_sequence_length=max_sequence_length,
+        )
+
+        # 2. Resolve working / output resolution.
+        height, width, ori_height, ori_width = self._resolve_output_size(height, width)
+
+        # 3. Prepare latents.
+        dtype = self.vae.dtype
+        latent_channels = self.transformer.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            latent_channels,
+            height,
+            width,
+            instruction_embeds.dtype,
+            device,
+            generator,
+        )
+
+        freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(
+            self.transformer.axes_dim_rope,
+            self.transformer.axes_lens,
+            theta=10000,
+        )
+
+        # 4. Timesteps (the ported scheduler consumes ``num_tokens``).
+        num_tokens = latents.shape[-2] * latents.shape[-1]
+        self.scheduler.set_timesteps(num_inference_steps, device=device, num_tokens=num_tokens)
+        timesteps = self.scheduler.timesteps
+        num_timesteps = len(timesteps)
+
+        # 5. Denoise loop with (sequential) classifier-free guidance.
+        with self.progress_bar(total=num_timesteps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                model_pred = self.predict(t, latents, instruction_embeds, freqs_cis, instruction_attention_mask)
+
+                in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
+                if do_classifier_free_guidance and in_cfg_range:
+                    model_pred_uncond = self.predict(
+                        t, latents, negative_instruction_embeds, freqs_cis, negative_instruction_attention_mask
+                    )
+                    model_pred = model_pred + (text_guidance_scale - 1) * (model_pred - model_pred_uncond)
+
+                latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                latents = latents.to(dtype=instruction_embeds.dtype)
+                progress_bar.update()
+
+        # 6. Decode.
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = latents.to(dtype=dtype)
+            if self.vae.config.scaling_factor is not None:
+                latents = latents / self.vae.config.scaling_factor
+            if self.vae.config.shift_factor is not None:
+                latents = latents + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
+            if (ori_height, ori_width) != (height, width):
+                image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
+
+        return DiffusionOutput(output=image)
