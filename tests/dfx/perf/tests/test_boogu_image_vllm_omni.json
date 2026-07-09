@@ -1,0 +1,53 @@
+[
+    {
+        "test_name": "test_boogu_image_single_device",
+        "description": "Single-device baseline (no parallelism), concurrency 1",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Base",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    },
+    {
+        "test_name": "test_boogu_image_single_device_concurrency_sweep",
+        "description": "Single-device Boogu-Image concurrency sweep at 512x512, 28 steps (concurrency 2, 4)",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Base",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28_concurrency_sweep",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": [2, 4],
+                "warmup-requests": 4,
+                "warmup-concurrency": 4,
+                "warmup-num-inference-steps": 28,
+                "enable-negative-prompt": true
+            }
+        ]
+    }
+]
