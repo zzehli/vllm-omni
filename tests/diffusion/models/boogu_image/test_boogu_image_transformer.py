@@ -343,3 +343,46 @@ def test_transformer_forward_t2i_shape():
 
     assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
     assert torch.isfinite(out).all()
+
+
+def test_transformer_forward_ti2i_shape():
+    """Editing path: a non-empty ``ref_image_hidden_states`` exercises the
+    reference-image patch embedder + refiner and must not change the output
+    shape (the output tracks the noise-latent dimensions)."""
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    model.eval()
+
+    batch_size = 1
+    in_channels = 4
+    latent_h = latent_w = 8
+    ref_h, ref_w = 6, 10  # a differently-sized reference latent
+    instruct_len = 8
+    instruction_feat_dim = 32
+
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
+    instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
+    freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(model.axes_dim_rope, model.axes_lens, theta=10000)
+
+    # One sample, one reference image (Boogu editing supports a single ref).
+    ref_image_hidden_states = [[torch.randn(in_channels, ref_h, ref_w)]]
+
+    with torch.no_grad():
+        out = model(
+            latents,
+            timestep,
+            instruction_hidden_states,
+            freqs_cis,
+            instruction_attention_mask,
+            ref_image_hidden_states=ref_image_hidden_states,
+        )
+
+    assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
+    assert torch.isfinite(out).all()

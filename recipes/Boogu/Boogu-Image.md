@@ -1,12 +1,12 @@
 # Boogu-Image
 
-> Text-to-image online serving (Boogu-Image-0.1-Base)
+> Text-to-image and image-editing online serving (Boogu-Image-0.1-Base / -Edit)
 
 ## Summary
 
 - Vendor: Boogu
-- Model: `Boogu/Boogu-Image-0.1-Base`
-- Task: Text-to-image generation
+- Model: `Boogu/Boogu-Image-0.1-Base` (text-to-image), `Boogu/Boogu-Image-0.1-Edit` (image editing)
+- Task: Text-to-image generation and text-guided image editing (TI2I)
 - Mode: Online serving with the OpenAI-compatible API
 - Maintainer: Community
 
@@ -103,3 +103,69 @@ curl -s http://localhost:8091/v1/chat/completions \
   (`--enable-cpu-offload` / `--enable-layerwise-offload`), Cache-DiT
   (`--cache-backend cache_dit`), and multi-GPU parallelism (TP / SP / CFG /
   HSDP) are planned follow-ups and are not validated for this model yet.
+
+## Image editing (Boogu-Image-0.1-Edit)
+
+The Edit checkpoint is served by the same native pipeline (`BooguImagePipeline`);
+the image-editing (TI2I) path activates automatically when a request carries a
+reference image. The Base text-to-image path is unaffected (no reference image
+is sent).
+
+#### Command
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Edit --omni --port 8091
+```
+
+#### Verification
+
+Edit an image with `/v1/images/edits` (the model-card example — change a photo
+to a colored-pencil drawing):
+
+```bash
+curl -s http://localhost:8091/v1/images/edits \
+  -F model="Boogu/Boogu-Image-0.1-Edit" \
+  -F image="@input.png" \
+  -F prompt="Change the style to a colored pencil drawing." \
+  -F 'extra_body={"num_inference_steps": 28, "guidance_scale": 5.0, "seed": 42}' \
+  | jq -r '.data[0].b64_json' | base64 -d > edited.png
+```
+
+Or via chat completions (attach the image as a data URL; parameters go in
+`extra_body`):
+
+```bash
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}},
+        {"type": "text", "text": "Change the style to a colored pencil drawing."}
+      ]}
+    ],
+    "extra_body": {
+      "num_inference_steps": 28,
+      "guidance_scale": 5.0,
+      "guidance_scale_2": 1.0,
+      "seed": 42
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > edited.png
+```
+
+#### Notes
+
+- **Single reference image:** only one input image is supported for now (the
+  upstream "Only support 1 reference image for now" limit).
+- **Guidance semantics:**
+  - `guidance_scale` = text guidance (upstream `text_guidance_scale`, default
+    `4.0`); `> 1.0` enables text CFG. Editing typically uses `5.0`.
+  - `guidance_scale_2` = image guidance (upstream `image_guidance_scale`,
+    default `1.0` = off). Setting it `> 1.0` enables the double-guidance path
+    (3 model predictions per step), steering more strongly toward the reference
+    image.
+- **Output resolution:** the output size follows the reference image (upstream
+  `align_res`, on by default for a single reference), so `height`/`width` are
+  derived from the input and requested sizes are not applied for edits.
+- **Same limitations** as the Base checkpoint apply (no CPU offload, Cache-DiT,
+  or multi-GPU parallelism yet).

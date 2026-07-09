@@ -23,8 +23,9 @@ import json
 import os
 import warnings
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import ClassVar, cast
 
+import PIL.Image
 import torch
 import torch.nn.functional as F
 from diffusers.image_processor import VaeImageProcessor
@@ -43,15 +44,25 @@ from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
     BooguImageDoubleStreamRotaryPosEmbed,
     BooguImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImageProcessor
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
     FlowMatchEulerDiscreteScheduler,
 )
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
+
+# Reference-image preprocessing limits (upstream ``BooguImagePipeline.__call__``
+# defaults). The VLM copy is aggressively downscaled for the Qwen3VL encoder;
+# the VAE copy keeps near-native resolution for the reference latents.
+_MAX_VLM_INPUT_PIL_PIXELS = 384 * 384
+_MAX_VLM_INPUT_PIL_SIDE_LENGTH = 384 * 2
+_MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
+_MAX_INPUT_IMAGE_SIDE_LENGTH = 2048 * 2
 
 
 def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
@@ -80,6 +91,85 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
+    """Build the pre-process callable for Boogu-Image reference (edit) input.
+
+    Text-to-image requests carry no image and are passed through unchanged (the
+    Base checkpoint shares this pipeline class). Edit (TI2I) requests carry a
+    single reference PIL image on ``prompt["multi_modal_data"]["image"]``; it is
+    resized twice — once for the Qwen3VL encoder (``prompt_image``) and once for
+    the VAE reference latents (``preprocessed_image``) — and stashed in
+    ``additional_information`` for ``forward`` to consume. Mirrors upstream
+    ``preprocess_vlm_input_pil_images`` + ``prepare_image``.
+
+    For a single reference image, upstream ``align_res`` (default ``True``)
+    derives the output resolution from the VAE-encoded reference dimensions, so
+    the request height/width are overwritten accordingly.
+    """
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+
+    # Upstream builds ``BooguImageProcessor(vae_scale_factor=vae_scale_factor*2)``
+    # so all resize targets align to multiples of ``vae_scale_factor * 2``.
+    image_processor = BooguImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
+
+    def pre_process_func(request: OmniDiffusionRequest):
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            # Plain-text prompt cannot carry an image -> text-to-image, no-op.
+            return request
+
+        multi_modal_data = prompt.get("multi_modal_data") or {}
+        raw_image = multi_modal_data.get("image")
+        if not raw_image:
+            # No reference image -> text-to-image, no-op (Base checkpoint).
+            return request
+
+        if isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                raise ValueError(f"Boogu-Image editing supports a single reference image; received {len(raw_image)}.")
+            raw_image = raw_image[0]
+
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image)
+        else:
+            image = cast(PIL.Image.Image, raw_image)
+        image = image.convert("RGB")
+
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
+
+        # VLM-resized copy (PIL) for the Qwen3VL instruction encoder.
+        vlm_height, vlm_width = image_processor.get_new_height_width(
+            image, None, None, _MAX_VLM_INPUT_PIL_PIXELS, _MAX_VLM_INPUT_PIL_SIDE_LENGTH
+        )
+        prompt_image = image_processor.resize(image, vlm_height, vlm_width)
+
+        # VAE-ready copy (normalized [1, C, H, W] tensor) for reference latents.
+        preprocessed_image = image_processor.preprocess(
+            image, max_pixels=_MAX_INPUT_IMAGE_PIXELS, max_side_length=_MAX_INPUT_IMAGE_SIDE_LENGTH
+        )
+
+        # align_res: single-image output resolution follows the reference dims.
+        request.sampling_params.height = int(preprocessed_image.shape[-2])
+        request.sampling_params.width = int(preprocessed_image.shape[-1])
+
+        prompt["additional_information"]["preprocessed_image"] = preprocessed_image
+        prompt["additional_information"]["prompt_image"] = prompt_image
+        request.prompt = prompt
+        return request
+
+    return pre_process_func
+
+
 # System prompts matching upstream dataset logic (ported verbatim from
 # ``BooguImagePipeline.__init__``).
 SYSTEM_PROMPT_4_TI2I_UNIFIED = (
@@ -93,10 +183,19 @@ SYSTEM_PROMPT_4_T2I_UNIFIED = (
 )
 
 
-class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
-    """Boogu-Image text-to-image pipeline (native vLLM-Omni implementation)."""
+class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
+    """Boogu-Image text-to-image and image-editing (TI2I) pipeline.
+
+    Native vLLM-Omni implementation. A request with a reference image (edit /
+    TI2I) is served by the same class as text-to-image; the reference latents
+    and Qwen3VL image tokens are threaded through ``forward`` and the ported
+    transformer's reference-image refiner path.
+    """
 
     supports_request_batch = False
+
+    support_image_input: ClassVar[bool] = True
+    color_format: ClassVar[str] = "RGB"
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["mllm"]
@@ -169,6 +268,9 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # Upstream uses the TI2I prompt for empty instructions (the default
         # negative prompt "" hits this path).
         self.SYSTEM_PROMPT_DROP = SYSTEM_PROMPT_4_TI2I_UNIFIED
+        # Edit (TI2I / I2I) system prompts (image present in the chat template).
+        self.SYSTEM_PROMPT_4_TI2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
+        self.SYSTEM_PROMPT_4_I2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -178,38 +280,63 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
     # Prompt encoding (upstream ``encode_instruction``, t2i path)
     # ------------------------------------------------------------------
 
-    def _apply_chat_template(self, instruction: str) -> list[dict]:
-        """Build the chat messages for one instruction (text-to-image only).
+    def _apply_chat_template(
+        self,
+        instruction: str,
+        input_pil_images: list[PIL.Image.Image] | None = None,
+    ) -> list[dict]:
+        """Build the chat messages for one instruction (text-to-image or edit).
 
-        Mirrors upstream ``_apply_chat_template`` with ``input_pil_images=None``:
-        an empty/whitespace instruction selects ``SYSTEM_PROMPT_DROP``.
+        Mirrors upstream ``_apply_chat_template`` (``system_prompt_follows_task_type``
+        is always ``False`` here): the system prompt is picked by whether images
+        are present and whether the instruction is empty, and reference images
+        are placed *before* the instruction text in the user turn.
         """
-        if instruction is None or len(instruction.strip()) == 0:
-            system_prompt = self.SYSTEM_PROMPT_DROP
-        else:
-            system_prompt = self.SYSTEM_PROMPT_4_T2I
+        user_text_content = [{"type": "text", "text": instruction}]
 
-        return [
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": instruction}]},
-        ]
+        has_images = input_pil_images is not None and len(input_pil_images) > 0
+        instruction_empty = instruction is None or len(instruction.strip()) == 0
+
+        if not has_images:
+            system_prompt = self.SYSTEM_PROMPT_DROP if instruction_empty else self.SYSTEM_PROMPT_4_T2I
+        else:
+            system_prompt = self.SYSTEM_PROMPT_4_I2I if instruction_empty else self.SYSTEM_PROMPT_4_TI2I
+
+        system_role = {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
+        if not has_images:
+            return [system_role, {"role": "user", "content": user_text_content}]
+
+        images_content = [{"type": "image", "image": pil_img} for pil_img in input_pil_images]
+        return [system_role, {"role": "user", "content": images_content + user_text_content}]
 
     def _get_instruction_feature_embeds(
         self,
         instruction: str | list[str],
+        input_pil_images: list[list[PIL.Image.Image] | None] | None = None,
         device: torch.device | None = None,
         max_sequence_length: int = 256,
         truncate_instruction_sequence: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode instructions with the Qwen3VL encoder.
+        """Encode instructions (and optional reference images) with Qwen3VL.
 
-        Returns the last hidden state (or the last-N layers as a list when the
-        transformer config asks for more than one) and the attention mask.
+        ``input_pil_images`` is a per-sample list (outer length == batch size);
+        each entry is the sample's already-VLM-resized reference images or
+        ``None``. Returns the last hidden state (or the last-N layers as a list
+        when the transformer config asks for more than one) and the attention
+        mask.
         """
         device = device or self._execution_device
         instruction = [instruction] if isinstance(instruction, str) else instruction
 
-        prompts = [self._apply_chat_template(text) for text in instruction]
+        if input_pil_images is None:
+            per_sample_images: list[list[PIL.Image.Image] | None] = [None] * len(instruction)
+        else:
+            assert len(input_pil_images) == len(instruction), (
+                "`input_pil_images` outer length must match the instruction batch size."
+            )
+            per_sample_images = input_pil_images
+
+        prompts = [self._apply_chat_template(text, per_sample_images[i]) for i, text in enumerate(instruction)]
 
         vlm_inputs = self.processor.apply_chat_template(
             prompts,
@@ -284,14 +411,22 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         negative_prompt_attention_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1280,
         truncate_instruction_sequence: bool = False,
+        input_images: list[list[PIL.Image.Image] | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Encode prompt (and negative prompt for CFG) into Qwen3VL hidden states.
 
-        Port of upstream ``encode_instruction`` restricted to text-to-image:
-        no reference images, no instruction rewriting, no prompt tuning, no
-        double-guidance empty instruction. The default ``max_sequence_length``
-        matches the upstream ``__call__`` default (1280), not the upstream
-        ``encode_instruction`` default (256).
+        Port of upstream ``encode_instruction`` for text-to-image and the
+        text-guided image-editing (TI2I) path. Reference images are attached to
+        the *positive* instruction only (upstream default
+        ``use_input_images_4_neg_instruct=False``). Instruction rewriting,
+        prompt tuning, and double-guidance empty instructions are not ported.
+        The default ``max_sequence_length`` matches the upstream ``__call__``
+        default (1280), not the upstream ``encode_instruction`` default (256).
+
+        Args:
+            input_images: Per-sample list (outer length == batch size) of
+                already-VLM-resized reference images, or ``None`` for pure
+                text-to-image.
 
         Returns:
             ``(prompt_embeds, prompt_attention_mask, negative_prompt_embeds,
@@ -307,6 +442,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         if prompt_embeds is None:
             prompt_embeds, prompt_attention_mask = self._get_instruction_feature_embeds(
                 instruction=prompt,
+                input_pil_images=input_images,
                 device=device,
                 max_sequence_length=max_sequence_length,
                 truncate_instruction_sequence=truncate_instruction_sequence,
@@ -376,8 +512,15 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         width = int(width * ratio) // img_scale_num * img_scale_num
         return height, width, ori_height, ori_width
 
-    def predict(self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask):
-        """One transformer velocity prediction (upstream ``predict``, t2i)."""
+    def predict(
+        self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_image_hidden_states=None
+    ):
+        """One transformer velocity prediction (upstream ``predict``).
+
+        ``ref_image_hidden_states`` is ``None`` for text-to-image, or the
+        per-sample reference latents (``list[list[Tensor[C, H, W]]]``) for the
+        image-editing path.
+        """
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
         return self.transformer(
             latents,
@@ -385,8 +528,74 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             instruction_embeds,
             freqs_cis,
             instruction_attention_mask,
-            ref_image_hidden_states=None,
+            ref_image_hidden_states=ref_image_hidden_states,
         )
+
+    def _encode_vae_image(self, img: torch.Tensor, generator=None) -> torch.Tensor:
+        """Encode an image tensor into the VAE latent space (upstream ``encode_vae``).
+
+        Upstream leaves ``latent_dist.sample()`` unseeded; the native path
+        threads the request generator through so a fixed seed gives a
+        reproducible reference latent.
+        """
+        z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
+        if self.vae.config.shift_factor is not None:
+            z0 = z0 - self.vae.config.shift_factor
+        if self.vae.config.scaling_factor is not None:
+            z0 = z0 * self.vae.config.scaling_factor
+        return z0.to(dtype=self.vae.dtype)
+
+    def _build_ref_latents(
+        self,
+        preprocessed_images: list[torch.Tensor | None],
+        num_images_per_prompt: int,
+        device: torch.device,
+        generator=None,
+    ) -> list[list[torch.Tensor] | None]:
+        """VAE-encode per-sample reference images into the transformer's format.
+
+        Mirrors upstream ``prepare_image``: returns a list of length
+        ``batch_size * num_images_per_prompt`` where each entry is either
+        ``None`` (no reference / text-to-image) or a list of ``[C, H, W]``
+        reference latents (one per reference image). Boogu editing uses a single
+        reference image, so each non-empty entry is a one-element list.
+        """
+        # ``latent_dist.sample`` accepts only a single generator; a per-output
+        # generator list (num_outputs_per_prompt > 1) falls back to unseeded.
+        vae_generator = generator if isinstance(generator, torch.Generator) else None
+
+        ref_latents: list[list[torch.Tensor] | None] = []
+        for image in preprocessed_images:
+            if image is None:
+                sample_latents: list[torch.Tensor] | None = None
+            else:
+                latent = self._encode_vae_image(image.to(device=device), generator=vae_generator).squeeze(0)
+                sample_latents = [latent]
+            for _ in range(num_images_per_prompt):
+                ref_latents.append(sample_latents)
+        return ref_latents
+
+    @staticmethod
+    def _extract_reference_images(
+        prompts: list,
+    ) -> tuple[list[PIL.Image.Image | None], list[torch.Tensor | None]]:
+        """Pull per-sample reference images out of ``additional_information``.
+
+        Returns ``(prompt_images, preprocessed_images)`` where entries are
+        ``None`` for pure text-to-image samples. Populated by
+        :func:`get_boogu_image_pre_process_func`.
+        """
+        prompt_images: list[PIL.Image.Image | None] = []
+        preprocessed_images: list[torch.Tensor | None] = []
+        for p in prompts:
+            if isinstance(p, str):
+                prompt_images.append(None)
+                preprocessed_images.append(None)
+                continue
+            ai = p.get("additional_information") or {}
+            prompt_images.append(ai.get("prompt_image"))
+            preprocessed_images.append(ai.get("preprocessed_image"))
+        return prompt_images, preprocessed_images
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # Prompt / negative-prompt extraction (mirrors the Ovis pattern; the
@@ -397,6 +606,11 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         else:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
+        # Reference (edit / TI2I) images, if any.
+        prompt_images, preprocessed_images = self._extract_reference_images(req.prompts)
+        has_reference = any(img is not None for img in preprocessed_images)
+        task_type = "ti2i" if has_reference else "t2i"
+
         sp = req.sampling_params
         device = self._execution_device
 
@@ -406,15 +620,28 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # Upstream default text guidance is 4.0; the engine coerces an unset
         # guidance_scale to 1.0, so only honor a caller-provided value.
         text_guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 4.0
+        # Image guidance rides on ``guidance_scale_2`` (upstream default 1.0 =
+        # off); only a caller-provided value enables the double-guidance path.
+        image_guidance_scale = sp.guidance_scale_2 if sp.guidance_scale_2_provided else 1.0
+        if not has_reference:
+            image_guidance_scale = 1.0
         num_images_per_prompt = sp.num_outputs_per_prompt if sp.num_outputs_per_prompt > 0 else 1
         generator = sp.generator
         max_sequence_length = sp.max_sequence_length or 1280
         output_type = sp.output_type or "pil"
         cfg_range = (0.0, 1.0)
 
+        # Negative instruction embeddings are needed whenever text guidance is
+        # active (t2i text CFG, ti2i text-only, and ti2i double guidance).
         do_classifier_free_guidance = text_guidance_scale > 1.0
 
         batch_size = len(prompt)
+
+        # Per-sample VLM reference images for the positive instruction only
+        # (upstream default ``use_input_images_4_neg_instruct=False``).
+        input_images = None
+        if has_reference:
+            input_images = [[img] if img is not None else None for img in prompt_images]
 
         # 1. Encode prompts.
         (
@@ -429,14 +656,19 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             num_images_per_prompt=num_images_per_prompt,
             device=device,
             max_sequence_length=max_sequence_length,
+            input_images=input_images,
         )
 
         # 2. Resolve working / output resolution.
         height, width, ori_height, ori_width = self._resolve_output_size(height, width)
 
-        # 3. Prepare latents.
+        # 3. Reference latents (edit path) and initial noise latents.
         dtype = self.vae.dtype
         latent_channels = self.transformer.in_channels
+        ref_latents = None
+        if has_reference:
+            ref_latents = self._build_ref_latents(preprocessed_images, num_images_per_prompt, device, generator)
+
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             latent_channels,
@@ -459,17 +691,69 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         timesteps = self.scheduler.timesteps
         num_timesteps = len(timesteps)
 
-        # 5. Denoise loop with (sequential) classifier-free guidance.
+        # 5. Denoise loop with (sequential) classifier-free guidance. Reproduces
+        # the branch priority of upstream ``processing`` (double > text-only >
+        # image-only > t2i text). Reference latents are kept in the conditional
+        # (and, for text-only ti2i, the unconditional) predictions.
         with self.progress_bar(total=num_timesteps) as progress_bar:
             for i, t in enumerate(timesteps):
-                model_pred = self.predict(t, latents, instruction_embeds, freqs_cis, instruction_attention_mask)
-
                 in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
-                if do_classifier_free_guidance and in_cfg_range:
-                    model_pred_uncond = self.predict(
-                        t, latents, negative_instruction_embeds, freqs_cis, negative_instruction_attention_mask
+                text_gs = text_guidance_scale if in_cfg_range else 1.0
+                image_gs = image_guidance_scale if in_cfg_range else 1.0
+
+                model_pred = self.predict(
+                    t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_latents
+                )
+
+                if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
+                    # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
+                    model_pred_drop_text = self.predict(
+                        t,
+                        latents,
+                        negative_instruction_embeds,
+                        freqs_cis,
+                        negative_instruction_attention_mask,
+                        ref_latents,
                     )
-                    model_pred = model_pred + (text_guidance_scale - 1) * (model_pred - model_pred_uncond)
+                    model_pred_drop_all = self.predict(
+                        t,
+                        latents,
+                        negative_instruction_embeds,
+                        freqs_cis,
+                        negative_instruction_attention_mask,
+                        None,
+                    )
+                    delta_text = model_pred - model_pred_drop_text
+                    delta_image = model_pred_drop_text - model_pred_drop_all
+                    model_pred = model_pred + (text_gs - 1) * delta_text + (image_gs - 1) * delta_image
+                elif task_type == "ti2i" and text_gs > 1.0:
+                    # Text-only ti2i guidance: reference kept in the uncond pred.
+                    model_pred_drop_text = self.predict(
+                        t,
+                        latents,
+                        negative_instruction_embeds,
+                        freqs_cis,
+                        negative_instruction_attention_mask,
+                        ref_latents,
+                    )
+                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_text)
+                elif task_type == "ti2i" and image_gs > 1.0:
+                    # Image-only ti2i guidance: drop the reference in the uncond pred.
+                    model_pred_drop_image = self.predict(
+                        t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, None
+                    )
+                    model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
+                elif text_gs > 1.0:
+                    # Text-to-image classifier-free guidance.
+                    model_pred_drop_all = self.predict(
+                        t,
+                        latents,
+                        negative_instruction_embeds,
+                        freqs_cis,
+                        negative_instruction_attention_mask,
+                        None,
+                    )
+                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_all)
 
                 latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
                 latents = latents.to(dtype=instruction_embeds.dtype)

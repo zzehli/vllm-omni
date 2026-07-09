@@ -413,3 +413,376 @@ def test_forward_cfg_off_when_guidance_one():
 
     # Only the positive prompt is encoded when CFG is off.
     assert len(pipeline.processor.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Editing / TI2I: pre-process function
+# ---------------------------------------------------------------------------
+
+
+def _make_edit_od_config(tmp_path, block_out_channels=(128, 256, 512, 512)):
+    import json
+
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir(parents=True, exist_ok=True)
+    (vae_dir / "config.json").write_text(json.dumps({"block_out_channels": list(block_out_channels)}))
+    return OmniDiffusionConfig(
+        model=str(tmp_path),
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+
+
+def _make_diffusion_request(prompt, **sampling_overrides):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    sampling = OmniDiffusionSamplingParams(**sampling_overrides)
+    return OmniDiffusionRequest(prompt=prompt, sampling_params=sampling, request_id="req-0")
+
+
+def test_pre_process_no_image_is_noop(tmp_path):
+    import PIL.Image  # noqa: F401  (import guard: PIL must be available)
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        get_boogu_image_pre_process_func,
+    )
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+
+    # Text-to-image request: no multimodal image -> returned unchanged.
+    req = _make_diffusion_request({"prompt": "a cat"}, height=123, width=456)
+    out = pre(req)
+    assert "additional_information" not in out.prompt
+    assert out.sampling_params.height == 123
+    assert out.sampling_params.width == 456
+
+    # A plain-string prompt cannot carry an image either.
+    str_req = _make_diffusion_request("a cat")
+    assert pre(str_req).prompt == "a cat"
+
+
+def test_pre_process_populates_reference_and_align_res(tmp_path):
+    import PIL.Image
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        get_boogu_image_pre_process_func,
+    )
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+
+    image = PIL.Image.new("RGB", (1000, 500))  # (width, height)
+    req = _make_diffusion_request({"prompt": "make it winter", "multi_modal_data": {"image": image}})
+    out = pre(req)
+
+    ai = out.prompt["additional_information"]
+    assert "prompt_image" in ai and "preprocessed_image" in ai
+
+    # VLM copy is a PIL image, downscaled, never upscaled, aligned to 16.
+    prompt_image = ai["prompt_image"]
+    assert isinstance(prompt_image, PIL.Image.Image)
+    assert prompt_image.width % 16 == 0 and prompt_image.height % 16 == 0
+    assert prompt_image.width <= 1000 and prompt_image.height <= 500
+    assert max(prompt_image.width, prompt_image.height) <= 768
+
+    # VAE copy is a normalized [1, C, H, W] tensor aligned to 16.
+    vae = ai["preprocessed_image"]
+    assert isinstance(vae, torch.Tensor) and vae.ndim == 4 and vae.shape[0] == 1
+    assert vae.shape[-1] % 16 == 0 and vae.shape[-2] % 16 == 0
+    assert -1.0 <= float(vae.min()) and float(vae.max()) <= 1.0
+
+    # align_res: the request resolution follows the VAE-encoded reference dims.
+    assert out.sampling_params.height == vae.shape[-2]
+    assert out.sampling_params.width == vae.shape[-1]
+
+
+def test_pre_process_rejects_multiple_images(tmp_path):
+    import PIL.Image
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        get_boogu_image_pre_process_func,
+    )
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+    imgs = [PIL.Image.new("RGB", (64, 64)), PIL.Image.new("RGB", (64, 64))]
+    req = _make_diffusion_request({"prompt": "combine", "multi_modal_data": {"image": imgs}})
+
+    with pytest.raises(ValueError, match="single reference image"):
+        pre(req)
+
+
+def test_pre_process_single_image_in_list_is_accepted(tmp_path):
+    import PIL.Image
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        get_boogu_image_pre_process_func,
+    )
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+    req = _make_diffusion_request({"prompt": "edit", "multi_modal_data": {"image": [PIL.Image.new("RGB", (128, 128))]}})
+    out = pre(req)
+    assert "preprocessed_image" in out.prompt["additional_information"]
+
+
+# ---------------------------------------------------------------------------
+# Editing / TI2I: chat template + image-aware encoding
+# ---------------------------------------------------------------------------
+
+
+def _make_edit_encode_pipeline():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        SYSTEM_PROMPT_4_TI2I_UNIFIED,
+    )
+
+    pipeline = _make_encode_pipeline()
+    pipeline.SYSTEM_PROMPT_4_TI2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
+    pipeline.SYSTEM_PROMPT_4_I2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
+    return pipeline
+
+
+def test_apply_chat_template_ti2i_places_image_before_text():
+    import PIL.Image
+
+    pipeline = _make_edit_encode_pipeline()
+    image = PIL.Image.new("RGB", (16, 16))
+
+    messages = pipeline._apply_chat_template("turn day into night", [image])
+    assert messages[0]["content"][0]["text"] == pipeline.SYSTEM_PROMPT_4_TI2I
+    user_content = messages[1]["content"]
+    # Image content comes first, then the instruction text.
+    assert user_content[0]["type"] == "image"
+    assert user_content[0]["image"] is image
+    assert user_content[-1] == {"type": "text", "text": "turn day into night"}
+
+    # Empty instruction with an image selects the I2I system prompt.
+    empty_messages = pipeline._apply_chat_template("", [image])
+    assert empty_messages[0]["content"][0]["text"] == pipeline.SYSTEM_PROMPT_4_I2I
+
+
+class _ImageAwareRecordingProcessor:
+    """Records whether reference images reached the processor."""
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, prompts, **kwargs):
+        has_image = []
+        for messages in prompts:
+            user_content = messages[1]["content"]
+            has_image.append(any(c.get("type") == "image" for c in user_content))
+        self.calls.append({"prompts": prompts, "kwargs": kwargs, "has_image": has_image})
+        batch = len(prompts)
+        input_ids = torch.arange(batch * _SEQ_LEN, dtype=torch.long).view(batch, _SEQ_LEN)
+        attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def test_encode_prompt_attaches_images_to_positive_only():
+    import PIL.Image
+
+    pipeline = _make_edit_encode_pipeline()
+    pipeline.processor = _ImageAwareRecordingProcessor()
+    image = PIL.Image.new("RGB", (16, 16))
+
+    pipeline.encode_prompt(
+        "add a rainbow",
+        do_classifier_free_guidance=True,
+        input_images=[[image]],
+    )
+
+    # Positive call carries the image; the negative (CFG) call is image-free.
+    assert pipeline.processor.calls[0]["has_image"] == [True]
+    assert pipeline.processor.calls[1]["has_image"] == [False]
+
+
+# ---------------------------------------------------------------------------
+# Editing / TI2I: reference-latent VAE encode
+# ---------------------------------------------------------------------------
+
+
+class _FakeRefVAE:
+    """Fake VAE whose ``encode`` yields a known latent for shape/scaling checks."""
+
+    dtype = torch.float32
+
+    def __init__(self, scaling_factor=2.0, shift_factor=0.5):
+        self.config = SimpleNamespace(scaling_factor=scaling_factor, shift_factor=shift_factor)
+        self._latent = torch.ones(1, 4, 3, 5)
+
+    def encode(self, img):
+        dist = SimpleNamespace(sample=lambda generator=None: self._latent.clone())
+        return SimpleNamespace(latent_dist=dist)
+
+
+def test_build_ref_latents_shape_and_scaling():
+    pipeline = _make_encode_pipeline()
+    pipeline.vae = _FakeRefVAE(scaling_factor=2.0, shift_factor=0.5)
+
+    preprocessed = torch.zeros(1, 3, 48, 80)  # normalized image tensor
+    ref_latents = pipeline._build_ref_latents([preprocessed], num_images_per_prompt=1, device=torch.device("cpu"))
+
+    assert len(ref_latents) == 1
+    (sample_latents,) = ref_latents
+    assert isinstance(sample_latents, list) and len(sample_latents) == 1
+    latent = sample_latents[0]
+    # squeeze(0) -> [C, H, W]; (1 - shift) * scaling = (1 - 0.5) * 2 = 1.0
+    assert latent.shape == (4, 3, 5)
+    assert torch.allclose(latent, torch.ones(4, 3, 5))
+
+
+def test_build_ref_latents_expands_per_output_and_handles_none():
+    pipeline = _make_encode_pipeline()
+    pipeline.vae = _FakeRefVAE()
+
+    preprocessed = torch.zeros(1, 3, 48, 80)
+    ref_latents = pipeline._build_ref_latents([preprocessed, None], num_images_per_prompt=2, device=torch.device("cpu"))
+
+    # Two samples x 2 outputs each = 4 entries; the None sample stays None.
+    assert len(ref_latents) == 4
+    assert ref_latents[0] is ref_latents[1]  # same sample repeated
+    assert ref_latents[2] is None and ref_latents[3] is None
+
+
+# ---------------------------------------------------------------------------
+# Editing / TI2I: forward CFG branch selection
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRefTransformer(_FakeTransformer):
+    """Counts predictions per step and records the reference-latent argument."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+        self.calls.append(kwargs.get("ref_image_hidden_states"))
+        return torch.zeros_like(latents)
+
+
+class _EditForwardVAE(_FakeDecodeVAE):
+    """Adds a fake ``encode`` so the editing forward path can build ref latents."""
+
+    def encode(self, img):
+        dist = SimpleNamespace(sample=lambda generator=None: torch.zeros(1, 4, 8, 8))
+        return SimpleNamespace(latent_dist=dist)
+
+
+def _make_edit_forward_pipeline():
+    pipeline = _make_edit_encode_pipeline()
+    # Image-aware processor: reference images appear as ``{"type": "image"}``
+    # content entries, which the default text-first fake cannot parse.
+    pipeline.processor = _ImageAwareRecordingProcessor()
+    pipeline.transformer = _RecordingRefTransformer()
+    pipeline.scheduler = _FakeScheduler()
+    pipeline.vae = _EditForwardVAE()
+    pipeline.vae_scale_factor = 8
+    pipeline.default_sample_size = 128
+    return pipeline
+
+
+def _make_edit_request(**sampling_overrides):
+    import PIL.Image
+
+    image = PIL.Image.new("RGB", (64, 64))
+    prompt = {
+        "prompt": "make it winter",
+        "additional_information": {
+            "prompt_image": image,
+            "preprocessed_image": torch.zeros(1, 3, 64, 64),
+        },
+    }
+    sampling = _sampling(**sampling_overrides)
+    return SimpleNamespace(prompts=[prompt], sampling_params=sampling)
+
+
+def _sampling(**overrides):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    return OmniDiffusionSamplingParams(**overrides)
+
+
+def _count_per_step(calls, num_steps):
+    assert len(calls) % num_steps == 0
+    return len(calls) // num_steps
+
+
+def test_forward_ti2i_text_only_two_predictions_with_ref():
+    pipeline = _make_edit_forward_pipeline()
+    num_steps = 2
+    req = _make_edit_request(height=64, width=64, num_inference_steps=num_steps, guidance_scale=5.0)
+    req.sampling_params.guidance_scale_provided = True
+
+    pipeline.forward(req)
+
+    # Text-only ti2i: cond+ref and neg+ref -> 2 predictions/step, both carry ref.
+    assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
+    assert all(ref is not None for ref in pipeline.transformer.calls)
+
+
+def test_forward_ti2i_double_guidance_three_predictions():
+    pipeline = _make_edit_forward_pipeline()
+    num_steps = 2
+    req = _make_edit_request(
+        height=64, width=64, num_inference_steps=num_steps, guidance_scale=5.0, guidance_scale_2=2.0
+    )
+    req.sampling_params.guidance_scale_provided = True
+    req.sampling_params.guidance_scale_2_provided = True
+
+    pipeline.forward(req)
+
+    # Double guidance: cond+ref, neg+ref, neg+no-ref -> 3 predictions/step.
+    assert _count_per_step(pipeline.transformer.calls, num_steps) == 3
+    # Exactly one of the three per step drops the reference (neg+no-ref).
+    per_step = [pipeline.transformer.calls[i : i + 3] for i in range(0, len(pipeline.transformer.calls), 3)]
+    for step_calls in per_step:
+        assert sum(ref is None for ref in step_calls) == 1
+
+
+def test_forward_ti2i_image_only_two_predictions_drop_ref():
+    pipeline = _make_edit_forward_pipeline()
+    num_steps = 2
+    # text guidance 1.0 (off, provided) + image guidance 2.0 (provided).
+    req = _make_edit_request(
+        height=64, width=64, num_inference_steps=num_steps, guidance_scale=1.0, guidance_scale_2=2.0
+    )
+    req.sampling_params.guidance_scale_provided = True
+    req.sampling_params.guidance_scale_2_provided = True
+
+    pipeline.forward(req)
+
+    # Image-only ti2i: cond+ref and cond+no-ref -> 2 predictions/step.
+    assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
+    per_step = [pipeline.transformer.calls[i : i + 2] for i in range(0, len(pipeline.transformer.calls), 2)]
+    for step_calls in per_step:
+        assert sum(ref is None for ref in step_calls) == 1
+
+
+def test_forward_ti2i_no_guidance_single_prediction_with_ref():
+    pipeline = _make_edit_forward_pipeline()
+    num_steps = 2
+    # Both guidances off/unprovided -> image guidance forced to 1.0, no CFG.
+    req = _make_edit_request(height=64, width=64, num_inference_steps=num_steps, guidance_scale=1.0)
+    req.sampling_params.guidance_scale_provided = True
+
+    pipeline.forward(req)
+
+    assert _count_per_step(pipeline.transformer.calls, num_steps) == 1
+    assert all(ref is not None for ref in pipeline.transformer.calls)
+
+
+def test_forward_image_guidance_ignored_without_reference():
+    # guidance_scale_2 is set but there is no reference image (t2i request);
+    # image guidance must be forced off so this stays plain t2i CFG.
+    pipeline = _make_edit_forward_pipeline()
+    num_steps = 2
+    sampling = _sampling(height=64, width=64, num_inference_steps=num_steps, guidance_scale=5.0, guidance_scale_2=2.0)
+    sampling.guidance_scale_provided = True
+    sampling.guidance_scale_2_provided = True
+    req = SimpleNamespace(prompts=[{"prompt": "a cat"}], sampling_params=sampling)
+
+    pipeline.forward(req)
+
+    # t2i text CFG: cond + uncond -> 2 predictions/step, no ref anywhere.
+    assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
+    assert all(ref is None for ref in pipeline.transformer.calls)
