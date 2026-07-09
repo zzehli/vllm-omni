@@ -120,14 +120,18 @@ vllm serve Boogu/Boogu-Image-0.1-Edit --omni --port 8091
 #### Verification
 
 Edit an image with `/v1/images/edits` (the model-card example — change a photo
-to a colored-pencil drawing):
+to a colored-pencil drawing). Diffusion parameters are plain multipart form
+fields; add `guidance_scale_2` to enable image guidance (double-guidance path):
 
 ```bash
 curl -s http://localhost:8091/v1/images/edits \
   -F model="Boogu/Boogu-Image-0.1-Edit" \
   -F image="@input.png" \
   -F prompt="Change the style to a colored pencil drawing." \
-  -F 'extra_body={"num_inference_steps": 28, "guidance_scale": 5.0, "seed": 42}' \
+  -F num_inference_steps=28 \
+  -F guidance_scale=5.0 \
+  -F guidance_scale_2=2.0 \
+  -F seed=42 \
   | jq -r '.data[0].b64_json' | base64 -d > edited.png
 ```
 
@@ -169,3 +173,8 @@ curl -s http://localhost:8091/v1/chat/completions \
   derived from the input and requested sizes are not applied for edits.
 - **Same limitations** as the Base checkpoint apply (no CPU offload, Cache-DiT,
   or multi-GPU parallelism yet).
+- **Offline editing:** the shared offline example
+  [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_to_image.md)
+  supports Boogu-Image-Edit directly
+  (`--model Boogu/Boogu-Image-0.1-Edit --guidance-scale 5.0`, optional
+  `--guidance-scale-2`).
