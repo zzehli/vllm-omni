@@ -19,7 +19,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -141,6 +141,47 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.fall_back_to_pt is True
 
 
+@pytest.mark.parametrize(
+    ("parallel_config", "cache_backend", "message"),
+    [
+        (DiffusionParallelConfig(tensor_parallel_size=2), "none", "Tensor parallelism"),
+        (DiffusionParallelConfig(ulysses_degree=2), "none", "Sequence parallelism"),
+        (DiffusionParallelConfig(ring_degree=2), "none", "Sequence parallelism"),
+        (DiffusionParallelConfig(cfg_parallel_size=2), "none", "CFG parallelism"),
+        (
+            DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2),
+            "none",
+            "HSDP",
+        ),
+        (DiffusionParallelConfig(), "cache_dit", "Cache backend 'cache_dit'"),
+        (DiffusionParallelConfig(), "tea_cache", "Cache backend 'tea_cache'"),
+    ],
+)
+def test_constructor_rejects_unsupported_execution_modes(
+    mock_dependencies,
+    parallel_config,
+    cache_backend,
+    message,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=parallel_config,
+        cache_backend=cache_backend,
+    )
+
+    with pytest.raises(NotImplementedError, match=message):
+        BooguImagePipeline(od_config=od_config)
+
+    # Validation happens before any checkpoint component is constructed.
+    mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Prompt-encoding tests (deterministic fakes, no constructor)
 # ---------------------------------------------------------------------------
@@ -172,10 +213,14 @@ class _FakeMLLM:
 
     dtype = torch.bfloat16
 
+    def __init__(self):
+        self.calls = []
+
     def __call__(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+        self.calls.append({"output_hidden_states": output_hidden_states, **kwargs})
         base = input_ids.to(torch.float32).unsqueeze(-1).repeat(1, 1, _EMBED_DIM)
         hidden = base + torch.arange(_EMBED_DIM, dtype=torch.float32)
-        return SimpleNamespace(last_hidden_state=hidden)
+        return SimpleNamespace(last_hidden_state=hidden, hidden_states=(hidden - 1, hidden))
 
 
 def _make_encode_pipeline(num_instruction_feature_layers: int = 1):
@@ -246,6 +291,37 @@ def test_encode_prompt_shapes_and_dtype():
     assert embeds.dtype == torch.bfloat16
     assert neg_embeds.dtype == torch.bfloat16
     assert torch.equal(mask[:, -1], torch.zeros(2, dtype=torch.long))
+
+
+def test_single_layer_encoding_requests_hidden_states_once():
+    pipeline = _make_encode_pipeline()
+
+    pipeline._get_instruction_feature_embeds("a dog")
+
+    assert pipeline.mllm.calls == [{"output_hidden_states": True, "return_dict": True}]
+
+
+def test_single_layer_encoding_propagates_mllm_failure():
+    pipeline = _make_encode_pipeline()
+    failure = RuntimeError("mllm failed")
+
+    class _FailingMLLM:
+        dtype = torch.bfloat16
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, **kwargs):
+            self.calls += 1
+            raise failure
+
+    pipeline.mllm = _FailingMLLM()
+
+    with pytest.raises(RuntimeError, match="mllm failed") as exc_info:
+        pipeline._get_instruction_feature_embeds("a dog")
+
+    assert exc_info.value is failure
+    assert pipeline.mllm.calls == 1
 
 
 def test_encode_prompt_cfg_negative_default_is_empty_string():

@@ -21,7 +21,6 @@ Ported from the upstream ``boogu`` package
 
 import json
 import os
-import warnings
 from collections.abc import Iterable
 from typing import ClassVar, cast
 
@@ -209,6 +208,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        self._raise_unsupported_features()
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -271,6 +271,22 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # Edit (TI2I / I2I) system prompts (image present in the chat template).
         self.SYSTEM_PROMPT_4_TI2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
         self.SYSTEM_PROMPT_4_I2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
+
+    def _raise_unsupported_features(self) -> None:
+        """Reject execution modes that do not have Boogu-specific support."""
+        parallel_config = self.od_config.parallel_config
+        if parallel_config.tensor_parallel_size > 1:
+            raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
+        if (parallel_config.sequence_parallel_size or 1) > 1:
+            raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
+        if parallel_config.cfg_parallel_size > 1:
+            raise NotImplementedError("CFG parallelism is not supported by BooguImagePipeline.")
+        if parallel_config.use_hsdp:
+            raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
+        if self.od_config.cache_backend not in (None, "", "none"):
+            raise NotImplementedError(
+                f"Cache backend '{self.od_config.cache_backend}' is not supported by BooguImagePipeline."
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -359,16 +375,11 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         )
 
         with torch.no_grad():
+            text_encoder_outputs = self.mllm(**vlm_inputs, output_hidden_states=True, return_dict=True)
             if num_instruction_feature_layers > 1:
-                text_encoder_outputs = self.mllm(**vlm_inputs, output_hidden_states=True, return_dict=True)
                 instruction_feats = list(text_encoder_outputs.hidden_states)[-num_instruction_feature_layers:]
             else:
-                try:
-                    instruction_feats = self.mllm(**vlm_inputs, output_hidden_states=False).last_hidden_state
-                except Exception as e:
-                    text_encoder_outputs = self.mllm(**vlm_inputs, output_hidden_states=True, return_dict=True)
-                    instruction_feats = text_encoder_outputs.hidden_states[-1]
-                    warnings.warn(f"{type(e).__name__}: {e}", UserWarning, stacklevel=2)
+                instruction_feats = text_encoder_outputs.hidden_states[-1]
 
         dtype = self.mllm.dtype if self.mllm is not None else self.transformer.dtype
 
