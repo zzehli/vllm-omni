@@ -94,7 +94,7 @@ def _tiny_tf_model_config(**overrides):
         "instruction_feature_configs": {
             "instruction_feat_dim": 32,
             "reduce_type": "mean",
-            "num_instruction_feat_layers": 1,
+            "num_instruction_feature_layers": 1,
         },
         "prompt_tuning_configs": {"use_prompt_tuning": False},
         "timestep_scale": 1.0,
@@ -243,6 +243,28 @@ def test_transformer_instantiates():
     # patch_size^2 * in_channels -> hidden_size
     assert model.x_embedder.in_features == 2 * 2 * 4
     assert model.x_embedder.out_features == HIDDEN_SIZE
+
+
+def test_transformer_preprocesses_multiple_instruction_feature_layers():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    instruction_feature_configs = {
+        "instruction_feat_dim": 32,
+        "reduce_type": "concat",
+        "num_instruction_feature_layers": 2,
+    }
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(instruction_feature_configs=instruction_feature_configs)
+    )
+    hidden_states = [torch.randn(1, 8, 32), torch.randn(1, 8, 32)]
+
+    processed = model.preprocess_instruction_hidden_states(hidden_states)
+
+    assert model.preprocessed_instruction_feat_dim == 64
+    assert processed.shape == (1, 8, 64)
+    assert torch.equal(processed, torch.cat(hidden_states, dim=-1))
 
 
 def test_transformer_validates_rope_dims():

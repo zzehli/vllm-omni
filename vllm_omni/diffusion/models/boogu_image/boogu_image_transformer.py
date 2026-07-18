@@ -789,11 +789,13 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
 
 
 def _cal_preprocessed_instruction_feat_dim(instruction_feature_configs: dict) -> int:
-    num_instruction_feat_layers = max(instruction_feature_configs.get("num_instruction_feat_layers", 1), 1)
+    num_instruction_feature_layers = max(
+        instruction_feature_configs.get("num_instruction_feature_layers", 1), 1
+    )
     instruction_feat_dim = instruction_feature_configs.get("instruction_feat_dim", 4096)
     reduce_type = instruction_feature_configs.get("reduce_type", "concat")
     if "cat" in reduce_type.lower():
-        return num_instruction_feat_layers * instruction_feat_dim
+        return num_instruction_feature_layers * instruction_feat_dim
     elif "mean" in reduce_type.lower():
         return instruction_feat_dim
     else:
@@ -839,7 +841,7 @@ class BooguImageTransformer2DModel(nn.Module):
         axes_lens = tuple(cfg.get("axes_lens", (2048, 1664, 1664)))
         instruction_feature_configs = cfg.get(
             "instruction_feature_configs",
-            {"instruction_feat_dim": 1024, "reduce_type": "mean", "num_instruction_feat_layers": 1},
+            {"instruction_feat_dim": 1024, "reduce_type": "mean", "num_instruction_feature_layers": 1},
         )
         prompt_tuning_configs = cfg.get("prompt_tuning_configs", {"use_prompt_tuning": False})
         timestep_scale = cfg.get("timestep_scale", 1.0)
@@ -991,13 +993,13 @@ class BooguImageTransformer2DModel(nn.Module):
         by ``concat`` or ``mean`` according to ``instruction_feature_configs``.
         """
         cfg = self.instruction_feature_configs
-        num_instruction_feat_layers = max(cfg.get("num_instruction_feat_layers", 1), 1)
+        num_instruction_feature_layers = max(cfg.get("num_instruction_feature_layers", 1), 1)
         reduce_type = cfg.get("reduce_type", "concat")
 
         if isinstance(raw_instruction_hidden_states, torch.Tensor):
             instruction_hidden_states = raw_instruction_hidden_states
         elif isinstance(raw_instruction_hidden_states, (list, tuple)):
-            assert len(raw_instruction_hidden_states) == num_instruction_feat_layers
+            assert len(raw_instruction_hidden_states) == num_instruction_feature_layers
             if "cat" in reduce_type.lower():
                 instruction_hidden_states = torch.cat(raw_instruction_hidden_states, dim=-1)
             elif "mean" in reduce_type.lower():
