@@ -1352,14 +1352,23 @@ class BooguImageTransformer2DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            original_name = name
             if ".img_instruct_attn.processor." in name:
                 name = name.replace(".img_instruct_attn.processor.", ".img_instruct_attn.")
             if ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
 
+            if name not in params_dict:
+                logger.warning("Skipping unexpected checkpoint weight %s", original_name)
+                continue
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        unloaded_params = sorted(params_dict.keys() - loaded_params)
+        if unloaded_params:
+            logger.warning("Model parameters not loaded from checkpoint: %s", unloaded_params)
 
         return loaded_params

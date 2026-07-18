@@ -64,6 +64,19 @@ _MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
 _MAX_INPUT_IMAGE_SIDE_LENGTH = 2048 * 2
 
 
+def _load_vae_scale_factor(model_path: str) -> int:
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    try:
+        with open(vae_config_path) as f:
+            vae_config = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to load Boogu VAE config from {vae_config_path}: {exc}") from exc
+
+    if "block_out_channels" not in vae_config:
+        return 8
+    return 2 ** (len(vae_config["block_out_channels"]) - 1)
+
+
 def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     """Build the post-process callable that converts decoded tensors to images.
 
@@ -77,10 +90,7 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = _load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -111,10 +121,7 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = _load_vae_scale_factor(model_path)
 
     # Upstream builds ``BooguImageProcessor(vae_scale_factor=vae_scale_factor*2)``
     # so all resize targets align to multiples of ``vae_scale_factor * 2``.

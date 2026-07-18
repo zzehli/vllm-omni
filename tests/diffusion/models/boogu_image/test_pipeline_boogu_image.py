@@ -510,6 +510,42 @@ def _make_edit_od_config(tmp_path, block_out_channels=(128, 256, 512, 512)):
     )
 
 
+@pytest.mark.parametrize(
+    "factory_name",
+    ["get_boogu_image_pre_process_func", "get_boogu_image_post_process_func"],
+)
+@pytest.mark.parametrize("config_contents", [None, "{not valid json"])
+def test_process_factory_reports_invalid_vae_config(tmp_path, factory_name, config_contents):
+    import importlib
+
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir()
+    if config_contents is not None:
+        (vae_dir / "config.json").write_text(config_contents)
+
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+    factory = getattr(importlib.import_module(_MODULE), factory_name)
+
+    with pytest.raises(RuntimeError, match=r"Failed to load Boogu VAE config from .*vae/config\.json"):
+        factory(od_config)
+
+
+@pytest.mark.parametrize(("height", "width"), [(0, 16), (16, 0), (0, 0)])
+def test_image_processor_rejects_non_positive_dimensions(height, width):
+    from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImageProcessor
+
+    image_processor = BooguImageProcessor()
+    image = torch.zeros(1, 3, 16, 16)
+
+    with pytest.raises(ValueError, match=rf"height={height}, width={width}"):
+        image_processor.get_new_height_width(image, height=height, width=width)
+
+
 def _make_diffusion_request(prompt, **sampling_overrides):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams

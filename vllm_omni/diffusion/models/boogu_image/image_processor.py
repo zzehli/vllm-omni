@@ -91,6 +91,9 @@ class BooguImageProcessor(VaeImageProcessor):
         if max_pixels is None:
             max_pixels = self.max_pixels
 
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Image height and width must be positive, got height={height}, width={width}")
+
         max_side_length_ratio = 1.0
         if max_side_length is not None:
             if height > width:

@@ -338,6 +338,29 @@ def test_transformer_load_weights_round_trip():
         assert torch.allclose(reloaded[native_name], expected)
 
 
+def test_transformer_load_weights_warns_for_unexpected_and_unloaded(caplog):
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    native_params = dict(model.named_parameters())
+    loaded_name = next(iter(native_params))
+    checkpoint_name = _native_to_checkpoint_name(loaded_name)
+
+    loaded = model.load_weights(
+        [
+            (checkpoint_name, torch.randn_like(native_params[loaded_name])),
+            ("unexpected.weight", torch.ones(1)),
+        ]
+    )
+
+    assert loaded == {loaded_name}
+    assert "Skipping unexpected checkpoint weight unexpected.weight" in caplog.text
+    assert "Model parameters not loaded from checkpoint" in caplog.text
+    assert next(name for name in native_params if name != loaded_name) in caplog.text
+
+
 def test_transformer_forward_t2i_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageDoubleStreamRotaryPosEmbed,
