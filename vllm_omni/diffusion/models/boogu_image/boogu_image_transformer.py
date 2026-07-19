@@ -789,9 +789,7 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
 
 
 def _cal_preprocessed_instruction_feat_dim(instruction_feature_configs: dict) -> int:
-    num_instruction_feature_layers = max(
-        instruction_feature_configs.get("num_instruction_feature_layers", 1), 1
-    )
+    num_instruction_feature_layers = max(instruction_feature_configs.get("num_instruction_feature_layers", 1), 1)
     instruction_feat_dim = instruction_feature_configs.get("instruction_feat_dim", 4096)
     reduce_type = instruction_feature_configs.get("reduce_type", "concat")
     if "cat" in reduce_type.lower():
