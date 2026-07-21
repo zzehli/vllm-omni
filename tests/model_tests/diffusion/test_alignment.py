@@ -45,6 +45,9 @@ EXCLUDED_MODELS = [
     "WanI2VDMD2Pipeline",
     "LongCatImagePipeline",
     "BagelPipeline",
+    # Uses a bespoke Qwen3-VL multi-component checkpoint layout and is covered
+    # by model-specific core CPU tests and H100 end-to-end tests.
+    "BooguImagePipeline",
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",
