@@ -4,7 +4,7 @@
 """
 L4 expansion coverage for ``Boogu/Boogu-Image-0.1-Edit`` (image editing / TI2I).
 
-The L2/L3 smoke module (``test_boogu_image_edit.py``) already covers single-image
+The nightly smoke module (``test_boogu_image_edit.py``) already covers single-image
 text-guided editing and the text+image double-guidance path. This expansion
 module adds the two edit paths smoke does not exercise:
 

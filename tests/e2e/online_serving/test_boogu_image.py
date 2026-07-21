@@ -15,8 +15,8 @@ parity vs. the Diffusers baseline is covered separately (see the support plan, s
 
 From ``tests/``::
 
-    pytest -s -v e2e/online_serving/test_boogu_image.py -m "core_model and diffusion" --run-level=core_model
-    pytest -s -v e2e/online_serving/test_boogu_image.py -m "advanced_model and diffusion" --run-level=advanced_model
+    pytest -s -v e2e/online_serving/test_boogu_image.py \
+        -m "full_model and diffusion and H100" --run-level=full_model
 """
 
 import os
@@ -27,6 +27,8 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "Boogu/Boogu-Image-0.1-Base"
 T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"
@@ -52,9 +54,6 @@ def _get_default_case(model: str):
     ]
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     """Default Boogu-Image T2I smoke (single ``default`` server config)."""
@@ -74,9 +73,6 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
 def test_batch_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     """Concurrent T2I: one ``request_config`` dict per prompt (``send_diffusion_request`` list mode)."""

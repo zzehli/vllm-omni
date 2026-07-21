@@ -4,7 +4,7 @@
 """
 L4 expansion coverage for ``Boogu/Boogu-Image-0.1-Base`` (text-to-image).
 
-The L2/L3 smoke module (``test_boogu_image.py``) already covers the default
+The nightly smoke module (``test_boogu_image.py``) already covers the default
 512x512 single request and a concurrent batch. This expansion module adds the
 request-level paths that smoke does not exercise, run against every currently
 supported single-GPU server configuration:

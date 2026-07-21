@@ -18,8 +18,8 @@ reference image is supported.
 
 From ``tests/``::
 
-    pytest -s -v e2e/online_serving/test_boogu_image_edit.py -m "core_model and diffusion" --run-level=core_model
-    pytest -s -v e2e/online_serving/test_boogu_image_edit.py -m "advanced_model and diffusion" --run-level=advanced_model
+    pytest -s -v e2e/online_serving/test_boogu_image_edit.py \
+        -m "full_model and diffusion and H100" --run-level=full_model
 """
 
 import base64
@@ -34,6 +34,8 @@ from tests.helpers.runtime import (
     OpenAIClientHandler,
     dummy_messages_from_mix_data,
 )
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 EDIT_PROMPT = "Change the style to a colored pencil drawing."
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
@@ -52,9 +54,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Boogu/Boogu-Image-0.1-Edit"),
@@ -80,8 +79,6 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Boogu/Boogu-Image-0.1-Edit"),
@@ -135,9 +132,6 @@ def _assert_edits_response_has_image(responses) -> None:
     assert body["data"][0].get("b64_json"), "Missing b64_json in /v1/images/edits response"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Boogu/Boogu-Image-0.1-Edit"),
@@ -149,8 +143,6 @@ def test_images_edits_endpoint_001(omni_server: OmniServer, openai_client: OpenA
     _assert_edits_response_has_image(responses)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Boogu/Boogu-Image-0.1-Edit"),
