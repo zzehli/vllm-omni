@@ -38,31 +38,6 @@ python image_edit.py \
   --guidance-scale 1.0
 ```
 
-### Image Editing with Boogu-Image-Edit
-
-`Boogu/Boogu-Image-0.1-Edit` uses guidance-distilled text guidance
-(`--guidance-scale`, recommended `5.0`) plus an optional image guidance
-(`--guidance-scale-2`, upstream `image_guidance_scale`; default `1.0` = off,
-`> 1.0` enables the double-guidance path that steers more strongly toward the
-reference image). Only a single reference image is supported, and the output
-resolution follows the reference image (upstream `align_res`), so
-`--width`/`--height` are not applied:
-
-```bash
-python image_edit.py \
-  --model Boogu/Boogu-Image-0.1-Edit \
-  --image input.png \
-  --prompt "Change the style to a colored pencil drawing." \
-  --output output_image_edit.png \
-  --num-inference-steps 28 \
-  --guidance-scale 5.0 \
-  --guidance-scale-2 2.0 \
-  --seed 42
-```
-
-See the [Boogu-Image recipe](../../../recipes/Boogu/Boogu-Image.md) for online
-serving and more details.
-
 Key arguments:
 
 - `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support.
