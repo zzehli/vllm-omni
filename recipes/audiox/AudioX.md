@@ -53,7 +53,7 @@ OpenAI chat-completions endpoint online. All model-specific knobs
 Offline — text tasks (`t2a` / `t2m`):
 
 ```bash
-huggingface-cli download zhangj1an/AudioX --local-dir ./audiox_weights
+hf download zhangj1an/AudioX --local-dir ./audiox_weights
 python examples/offline_inference/text_to_audio/text_to_audio.py \
   --model ./audiox_weights --task t2a \
   --prompt "Fireworks burst twice, followed by a clock ticking." \
